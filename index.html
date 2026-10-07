@@ -1,0 +1,69 @@
+<!doctype html>
+<html lang="en">
+
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width,initial-scale=1">
+    <meta name="theme-color" content="#17202a">
+    <title>Property Maintenance</title>
+    <link rel="manifest" href="manifest.webmanifest">
+    <link rel="stylesheet" href="styles.css">
+</head>
+
+<body>
+
+    <header class="topbar">
+        <div>
+            <h1>Property Maintenance</h1>
+            <p>Home, yard, vehicles and equipment — all in one place.</p>
+        </div>
+    </header>
+
+    <main class="container">
+
+        <nav class="tabs">
+            <button class="tab active" data-tab="weekend">Weekend</button>
+            <button class="tab" data-tab="calendar">Calendar</button>
+            <button class="tab" data-tab="maintenance">Maintenance</button>
+            <button class="tab" data-tab="todo">To-Do</button>
+            <button class="tab" data-tab="shopping">Shopping</button>
+        </nav>
+
+        <section id="weekend" class="view active"></section>
+        <section id="calendar" class="view"></section>
+        <section id="maintenance" class="view"></section>
+        <section id="todo" class="view"></section>
+        <section id="shopping" class="view"></section>
+
+    </main>
+
+    <dialog id="modal">
+
+        <form id="form">
+
+            <div class="modalhead">
+                <h2 id="modalTitle"></h2>
+                <button id="closeModal" type="button">×</button>
+            </div>
+
+            <div id="formBody"></div>
+
+            <footer>
+                <button id="cancelModal" type="button" class="secondary">
+                    Cancel
+                </button>
+
+                <button id="save" type="submit" class="primary">
+                    Save
+                </button>
+            </footer>
+
+        </form>
+
+    </dialog>
+
+    <script src="app.js"></script>
+
+</body>
+
+</html>
