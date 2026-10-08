@@ -178,6 +178,10 @@ function normalizeTask(task) {
         task.completedAt = null;
     }
 
+    if (!Array.isArray(task.occurrenceOverrides)) {
+        task.occurrenceOverrides = [];
+    }
+
     if (!Array.isArray(task.materials)) {
         task.materials = [];
     }
@@ -1205,17 +1209,45 @@ function recurrenceMatchesDate(task, date) {
         return task.due === date;
     }
 
-    const target =
-        parseDate(date);
-
-    const start =
-        parseDate(task.due);
-
-    if (target < start) {
+    if (!isWithinCalendarHorizon(date)) {
         return false;
     }
 
-    if (!isWithinCalendarHorizon(date)) {
+    const overrides = task.occurrenceOverrides || [];
+
+    // An individually moved occurrence appears on its new date.
+    if (overrides.some(x => x.newDate === date)) {
+        return true;
+    }
+
+    // A moved occurrence replaces the scheduled occurrences
+    // between its original date and its new date.
+    const isReplacedOccurrence = overrides.some(override => {
+        const start =
+            override.originalDate < override.newDate
+                ? override.originalDate
+                : override.newDate;
+
+        const end =
+            override.originalDate > override.newDate
+                ? override.originalDate
+                : override.newDate;
+
+        return (
+            date >= start &&
+            date <= end &&
+            date !== override.newDate
+        );
+    });
+
+    if (isReplacedOccurrence) {
+        return false;
+    }
+
+    const target = parseDate(date);
+    const start = parseDate(task.due);
+
+    if (target < start) {
         return false;
     }
 
@@ -1225,25 +1257,17 @@ function recurrenceMatchesDate(task, date) {
             return true;
 
         case 'weekly': {
-            const diff =
-                Math.round(
-                    (
-                        target - start
-                    ) /
-                    86400000
-                );
+            const diff = Math.round(
+                (target - start) / 86400000
+            );
 
             return diff % 7 === 0;
         }
 
         case 'biweekly': {
-            const diff =
-                Math.round(
-                    (
-                        target - start
-                    ) /
-                    86400000
-                );
+            const diff = Math.round(
+                (target - start) / 86400000
+            );
 
             return diff % 14 === 0;
         }
@@ -1253,16 +1277,13 @@ function recurrenceMatchesDate(task, date) {
         case '6months':
         case 'yearly': {
 
-            let cursor =
-                task.due;
+            let cursor = task.due;
 
             while (cursor < date) {
-
-                const next =
-                    nextOccurrence(
-                        cursor,
-                        task.recurrence
-                    );
+                const next = nextOccurrence(
+                    cursor,
+                    task.recurrence
+                );
 
                 if (!next || next > date) {
                     return false;
@@ -1657,12 +1678,12 @@ function calendarEventClick(event) {
 
 function calendarDragStart(event) {
 
-    const element =
-        event.currentTarget;
+    const element = event.currentTarget;
 
     draggedCalendarItem = {
         id: Number(element.dataset.id),
-        type: element.dataset.type
+        type: element.dataset.type,
+        date: element.dataset.date
     };
 
     event.dataTransfer.effectAllowed = 'move';
@@ -1774,31 +1795,34 @@ function calendarDrop(event) {
      * nothing needs to happen.
      */
 
-    if (task.due === date) {
+    // Find the actual scheduled occurrence represented
+    // by the calendar item. This also supports moving
+    // an occurrence that was already moved before.
+    const sourceDate = item.date;
+
+    const existingOverride =
+        (task.occurrenceOverrides || []).find(
+            x => x.newDate === sourceDate
+        );
+
+    const originalDate =
+        existingOverride
+            ? existingOverride.originalDate
+            : sourceDate;
+
+    if (sourceDate === date) {
         return;
     }
 
+    // YES: Move the schedule itself.
+    // The new date becomes the recurring anchor.
+    if (task.adjustSchedule) {
 
-    /*
-     * IMPORTANT:
-     *
-     * Do not open confirm() directly inside
-     * the browser's drop event.
-     *
-     * Defer it until the drop event has
-     * completely finished.
-     */
+        const recurrence = recurrenceLabel(task.recurrence);
 
-    const recurrence =
-        recurrenceLabel(
-            task.recurrence
-        );
+        setTimeout(() => {
 
-
-    setTimeout(() => {
-
-        const confirmed =
-            confirm(
+            const confirmed = confirm(
                 `"${task.name}" is a recurring maintenance item.\n\n` +
                 `Moving it to ${date} will change the schedule anchor.\n` +
                 `Future occurrences will continue from the new date ` +
@@ -1806,26 +1830,42 @@ function calendarDrop(event) {
                 `Do you want to move the entire schedule?`
             );
 
+            if (!confirmed) {
+                renderCalendar();
+                return;
+            }
 
-        if (!confirmed) {
+            task.due = date;
+            task.occurrenceOverrides = [];
 
-            renderCalendar();
+            save();
+            render();
 
-            return;
-        }
+        }, 0);
 
+        return;
+    }
 
-        /*
-         * User confirmed the move.
-         */
+    // NO: Move only this occurrence.
+    // The recurring schedule remains anchored.
+    if (!Array.isArray(task.occurrenceOverrides)) {
+        task.occurrenceOverrides = [];
+    }
 
-        task.due = date;
+    // Remove the old override if this occurrence
+    // had already been moved.
+    task.occurrenceOverrides =
+        task.occurrenceOverrides.filter(
+            x => x.originalDate !== originalDate
+        );
 
-        save();
+    task.occurrenceOverrides.push({
+        originalDate,
+        newDate: date
+    });
 
-        render();
-
-    }, 0);
+    save();
+    render();
 }
 
 
