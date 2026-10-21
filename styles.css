@@ -588,3 +588,8 @@ NEW CATEGORY
         margin-left: 28px;
     }
 }
+/* Completed occurrences stay visible on the calendar */
+.calendar-done .calendar-event-name {
+    text-decoration: line-through;
+    opacity: .55;
+}
