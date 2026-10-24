@@ -1,4 +1,5 @@
 const K = 'propertyMaintenance.v2';
+const BACKUP_KEY = K + '.backup-before-occurrences';
 const CALENDAR_HORIZON_MONTHS = 12;
 
 const now = new Date();
@@ -99,6 +100,7 @@ const U = addDays(S, 1);
 
 const defaultDB = {
     tasks: [],
+    occurrences: [],
     todos: [],
     shopping: [],
     categories: [
@@ -149,9 +151,11 @@ function normalizeRecurrence(value) {
         'monthly': 'monthly',
         'every month': 'monthly',
 
+        '3months': '3months',
         '3 months': '3months',
         'every 3 months': '3months',
 
+        '6months': '6months',
         '6 months': '6months',
         'every 6 months': '6months',
 
@@ -166,34 +170,36 @@ function normalizeRecurrence(value) {
 
 
 function normalizeTask(task) {
-
-    task.recurrence =
-        normalizeRecurrence(task.recurrence);
+    task.recurrence = normalizeRecurrence(task.recurrence);
 
     if (typeof task.adjustSchedule !== 'boolean') {
         task.adjustSchedule = false;
     }
 
-    if (!('completedAt' in task)) {
-        task.completedAt = null;
+    if (!task.anchor) {
+        task.anchor =
+            task.scheduleAnchor || task.due || today();
     }
 
-    if (!Array.isArray(task.occurrenceOverrides)) {
-        task.occurrenceOverrides = [];
+    if (!Number.isInteger(task.nextIndex)) {
+        task.nextIndex = 0;
     }
 
     if (!Array.isArray(task.materials)) {
         task.materials = [];
     }
 
-    task.materials =
-        task.materials
-            .map(normalizeMaterial)
-            .filter(x => x.name);
+    task.materials = task.materials
+        .map(normalizeMaterial)
+        .filter(x => x.name);
 
-    if (!task.due) {
-        task.due = today();
-    }
+    // Schedule state now lives in db.occurrences.
+    delete task.due;
+    delete task.done;
+    delete task.completedAt;
+    delete task.scheduleAnchor;
+    delete task.exceptions;
+    delete task.completedDates;
 
     return task;
 }
@@ -299,21 +305,37 @@ function syncCategories() {
         );
 }
 
-db.tasks = Array.isArray(db.tasks)
-    ? db.tasks.map(normalizeTask)
-    : [];
+/* Brings any loaded or imported data up to the current shape. */
+function prepareDB() {
 
-db.todos = Array.isArray(db.todos)
-    ? db.todos
-    : [];
+    migrateToOccurrences();
 
-db.shopping = Array.isArray(db.shopping)
-    ? db.shopping
-    : [];
+    db.tasks = Array.isArray(db.tasks)
+        ? db.tasks.map(normalizeTask)
+        : [];
 
-syncCategories();
-syncShop();
-save();
+    db.todos = Array.isArray(db.todos)
+        ? db.todos
+        : [];
+
+    db.shopping = Array.isArray(db.shopping)
+        ? db.shopping
+        : [];
+
+    // Drop occurrences whose maintenance item no longer exists.
+    const taskIds = new Set(db.tasks.map(t => t.id));
+
+    db.occurrences = (
+        Array.isArray(db.occurrences) ? db.occurrences : []
+    ).filter(o => taskIds.has(o.taskId));
+
+    syncCategories();
+    syncShop();
+    topUpAllOccurrences();
+    save();
+}
+
+prepareDB();
 
 function save() {
     localStorage.setItem(K, JSON.stringify(db));
@@ -509,6 +531,408 @@ function nextOccurrence(date, recurrence) {
 
 
 /* =========================
+   OCCURRENCES
+   -------------------------
+   db.tasks        = maintenance templates (what / how often)
+   db.occurrences  = one record per scheduled instance:
+     { id, taskId, date, done, completedOn, sourceOcc? }
+   Dragging, completing and un-completing only ever touch
+   a single occurrence record.
+========================= */
+
+function uid() {
+    const id = Math.max(Date.now(), db.seq || 0) + 1;
+    db.seq = id;
+    return id;
+}
+
+function occurrenceDate(anchor, recurrence, n) {
+    switch (recurrence) {
+        case 'daily': return addDays(anchor, n);
+        case 'weekly': return addDays(anchor, n * 7);
+        case 'biweekly': return addDays(anchor, n * 14);
+        case 'monthly': return addMonths(anchor, n);
+        case '3months': return addMonths(anchor, n * 3);
+        case '6months': return addMonths(anchor, n * 6);
+        case 'yearly': return addYears(anchor, n);
+        default: return anchor;
+    }
+}
+
+function newOccurrence(taskId, date, extra = {}) {
+    const occ = {
+        id: uid(),
+        taskId,
+        date,
+        done: false,
+        completedOn: null,
+        ...extra
+    };
+
+    db.occurrences.push(occ);
+
+    return occ;
+}
+
+function taskOccurrences(taskId) {
+    return db.occurrences.filter(o => o.taskId === taskId);
+}
+
+function taskNextDue(task) {
+    const occs = taskOccurrences(task.id);
+
+    const open = occs
+        .filter(o => !o.done)
+        .map(o => o.date)
+        .sort();
+
+    if (open.length) return open[0];
+
+    // Finished one-off: show its date.
+    if (task.recurrence === 'none' && occs.length) {
+        return occs[0].date;
+    }
+
+    return null;
+}
+
+function taskLastCompleted(task) {
+    const done = taskOccurrences(task.id)
+        .filter(o => o.done && o.completedOn)
+        .map(o => o.completedOn)
+        .sort();
+
+    return done.length ? done[done.length - 1] : null;
+}
+
+/* Create any occurrences that should exist but don't yet. */
+function topUpOccurrences(task) {
+
+    if (task.recurrence === 'none') {
+
+        if (!taskOccurrences(task.id).length) {
+            newOccurrence(task.id, task.anchor);
+        }
+
+        return;
+    }
+
+    // "Based on actual completion": the series is projected ahead from
+    // the next open date; completing an item re-projects everything
+    // after it from the actual completion date.
+    if (task.adjustSchedule) {
+
+        const t0 = today();
+        const end = addMonths(t0, CALENDAR_HORIZON_MONTHS);
+
+        const open = taskOccurrences(task.id)
+            .filter(o => !o.done)
+            .map(o => o.date)
+            .sort();
+
+        let cursor;
+
+        if (open.length) {
+            cursor = open[open.length - 1];
+        } else {
+            const last = taskLastCompleted(task);
+
+            cursor = last
+                ? nextOccurrence(last, task.recurrence)
+                : task.anchor;
+
+            newOccurrence(task.id, cursor);
+        }
+
+        for (let i = 0; i < 5000; i++) {
+            const next = nextOccurrence(cursor, task.recurrence);
+
+            if (!next || next > end) break;
+
+            newOccurrence(task.id, next);
+            cursor = next;
+        }
+
+        return;
+    }
+
+    // Fixed schedule: keep occurrences generated through the horizon.
+    const t0 = today();
+    const end = addMonths(t0, CALENDAR_HORIZON_MONTHS);
+
+    for (let i = 0; i < 5000; i++) {
+
+        const date = occurrenceDate(
+            task.anchor,
+            task.recurrence,
+            task.nextIndex
+        );
+
+        if (date > end) break;
+
+        // The first occurrence may be overdue; later past dates
+        // (app unused for a while) are not back-filled.
+        if (task.nextIndex === 0 || date >= t0) {
+            newOccurrence(task.id, date);
+        }
+
+        task.nextIndex++;
+    }
+}
+
+/* Project open occurrences after `fromDate`, one interval apart. */
+function projectSeries(task, fromDate, sourceOcc = null) {
+
+    const end = addMonths(today(), CALENDAR_HORIZON_MONTHS);
+
+    for (let k = 1; k < 5000; k++) {
+
+        const date = occurrenceDate(
+            fromDate,
+            task.recurrence,
+            k
+        );
+
+        if (date > end) break;
+
+        newOccurrence(
+            task.id,
+            date,
+            sourceOcc ? { sourceOcc } : {}
+        );
+    }
+}
+
+function topUpAllOccurrences() {
+    db.tasks.forEach(topUpOccurrences);
+}
+
+/* Throw away open occurrences and rebuild from a new start date. */
+function rescheduleTask(task, newAnchor) {
+
+    db.occurrences = db.occurrences.filter(
+        o => o.taskId !== task.id || o.done
+    );
+
+    task.anchor = newAnchor;
+    task.nextIndex = 0;
+
+    topUpOccurrences(task);
+}
+
+/* Occurrence + its template, shaped like the old task objects
+   so the existing renderers keep working. */
+function occurrenceView(occ, taskMap) {
+
+    const task = taskMap.get(occ.taskId);
+
+    if (!task) return null;
+
+    return {
+        ...task,
+        id: occ.id,
+        taskId: task.id,
+        due: occ.date,
+        done: occ.done,
+        completedOn: occ.completedOn
+    };
+}
+
+function occurrenceViews(filter = () => true) {
+
+    const taskMap = new Map(
+        db.tasks.map(t => [t.id, t])
+    );
+
+    return db.occurrences
+        .filter(filter)
+        .map(o => occurrenceView(o, taskMap))
+        .filter(Boolean);
+}
+
+function completeOccurrence(occ, completedDate) {
+
+    const task = db.tasks.find(x => x.id === occ.taskId);
+
+    const followsCompletion =
+        task &&
+        task.recurrence !== 'none' &&
+        task.adjustSchedule;
+
+    const dropOtherOpen = () => {
+        db.occurrences = db.occurrences.filter(
+            o => o.taskId !== occ.taskId || o.done || o.id === occ.id
+        );
+    };
+
+    if (!occ.done) {
+
+        occ.done = true;
+        occ.completedOn = completedDate || today();
+
+        // A completed item sits on the day it was actually done.
+        // The scheduled date is remembered so Undo can restore it.
+        occ.originalDate = occ.date;
+        occ.date = occ.completedOn;
+
+        if (followsCompletion) {
+
+            // Everything after this one is re-projected from the
+            // actual completion date.
+            dropOtherOpen();
+
+            newOccurrence(
+                task.id,
+                nextOccurrence(occ.completedOn, task.recurrence),
+                { sourceOcc: occ.id }
+            );
+
+            projectSeries(
+                task,
+                nextOccurrence(occ.completedOn, task.recurrence),
+                occ.id
+            );
+        }
+
+    } else {
+
+        occ.done = false;
+        occ.completedOn = null;
+
+        if (occ.originalDate) {
+            occ.date = occ.originalDate;
+        }
+
+        delete occ.originalDate;
+
+        if (followsCompletion) {
+
+            // Undo: restore the projection from this occurrence's date.
+            dropOtherOpen();
+            projectSeries(task, occ.date);
+
+        } else {
+
+            db.occurrences = db.occurrences.filter(
+                o => !(o.sourceOcc === occ.id && !o.done)
+            );
+        }
+    }
+
+    save();
+    render();
+}
+
+/* One-time upgrade from the old exceptions/completedDates model. */
+function migrateToOccurrences() {
+
+    if (Array.isArray(db.occurrences)) return;
+
+    const raw = localStorage.getItem(K);
+
+    if (raw && !localStorage.getItem(BACKUP_KEY)) {
+        localStorage.setItem(BACKUP_KEY, raw);
+    }
+
+    db.occurrences = [];
+
+    const t0 = today();
+    const end = addMonths(t0, CALENDAR_HORIZON_MONTHS);
+
+    (Array.isArray(db.tasks) ? db.tasks : []).forEach(old => {
+
+        const rec = normalizeRecurrence(old.recurrence);
+        const anchor = old.scheduleAnchor || old.due || t0;
+
+        const add = (date, done, completedOn) => {
+            if (
+                !done &&
+                db.occurrences.some(
+                    o => o.taskId === old.id && !o.done && o.date === date
+                )
+            ) return;
+
+            newOccurrence(old.id, date, {
+                done: !!done,
+                completedOn: completedOn || null
+            });
+        };
+
+        old.recurrence = rec;
+        old.anchor = anchor;
+        old.nextIndex = 0;
+
+        if (rec === 'none') {
+            add(
+                old.due || t0,
+                !!old.done,
+                old.done ? (old.completedAt || null) : null
+            );
+            return;
+        }
+
+        const completed = [...new Set(old.completedDates || [])].sort();
+
+        completed.forEach(d => add(d, true, d));
+
+        const exceptions = old.exceptions || [];
+
+        // Individually moved occurrences.
+        exceptions
+            .filter(e =>
+                e.newDate &&
+                !e.completed &&
+                !completed.includes(e.newDate)
+            )
+            .forEach(e => add(e.newDate, false, null));
+
+        if (old.adjustSchedule) {
+
+            if (old.due && !completed.includes(old.due)) {
+                add(old.due, false, null);
+            }
+
+            return;
+        }
+
+        const skipped = new Set(
+            exceptions.flatMap(e => e.skippedDates || [])
+        );
+
+        const lastDone = completed.length
+            ? completed[completed.length - 1]
+            : null;
+
+        let pastAdded = false;
+        let n = 0;
+
+        for (; n < 20000; n++) {
+
+            const date = occurrenceDate(anchor, rec, n);
+
+            if (date > end) break;
+
+            if (skipped.has(date) || completed.includes(date)) continue;
+            if (lastDone && date <= lastDone) continue;
+
+            if (date < t0) {
+                // Keep only the earliest missed one as "overdue".
+                if (!pastAdded) {
+                    add(date, false, null);
+                    pastAdded = true;
+                }
+                continue;
+            }
+
+            add(date, false, null);
+        }
+
+        old.nextIndex = n;
+    });
+}
+
+
+/* =========================
    WEEKEND
 ========================= */
 
@@ -586,11 +1010,20 @@ function renderWeekend() {
 
     const todayDate = today();
 
-    const overdueMaintenance = db.tasks.filter(x =>
-        !x.done &&
-        x.due &&
-        x.due < todayDate
-    );
+    const maintenanceViews = occurrenceViews(o => !o.done);
+
+    // One overdue entry per task (the oldest), so a missed
+    // daily task doesn't flood the list.
+    const overdueMaintenance = [];
+
+    maintenanceViews
+        .filter(x => x.due < todayDate)
+        .sort((a, b) => a.due.localeCompare(b.due))
+        .forEach(x => {
+            if (!overdueMaintenance.some(y => y.taskId === x.taskId)) {
+                overdueMaintenance.push(x);
+            }
+        });
 
     const overdueTodos = db.todos.filter(x =>
         !x.done &&
@@ -598,8 +1031,7 @@ function renderWeekend() {
         x.planned < todayDate
     );
 
-    const dueTodayMaintenance = db.tasks.filter(x =>
-        !x.done &&
+    const dueTodayMaintenance = maintenanceViews.filter(x =>
         x.due === todayDate
     );
 
@@ -609,8 +1041,7 @@ function renderWeekend() {
     );
 
     const saturdayItems = [
-        ...db.tasks.filter(x =>
-            !x.done &&
+        ...maintenanceViews.filter(x =>
             x.due === S
         ),
         ...db.todos.filter(x =>
@@ -620,8 +1051,7 @@ function renderWeekend() {
     ];
 
     const sundayItems = [
-        ...db.tasks.filter(x =>
-            !x.done &&
+        ...maintenanceViews.filter(x =>
             x.due === U
         ),
         ...db.todos.filter(x =>
@@ -808,7 +1238,7 @@ function renderMaintenance() {
 
                 · ${recurrenceLabel(t.recurrence)}
 
-                · Next ${esc(t.due)}
+                · Next ${esc(taskNextDue(t) || '—')}
 
                 · ${t.minutes || 0} min
 
@@ -826,10 +1256,10 @@ function renderMaintenance() {
             : ''
         }
 
-              ${t.completedAt
+              ${taskLastCompleted(t)
             ? `
                     <div class="meta">
-                      Last completed ${esc(t.completedAt)}
+                      Last completed ${esc(taskLastCompleted(t))}
                     </div>
                     `
             : ''
@@ -1133,6 +1563,7 @@ function findPrices(name) {
 
 let calendarYear = now.getFullYear();
 let calendarMonth = now.getMonth();
+let calendarSelected = null;
 
 
 function changeMonth(amount) {
@@ -1149,6 +1580,8 @@ function changeMonth(amount) {
         calendarYear--;
     }
 
+    calendarSelected = null;
+
     renderCalendar();
 }
 
@@ -1157,34 +1590,11 @@ function goToday() {
 
     calendarYear = now.getFullYear();
     calendarMonth = now.getMonth();
+    calendarSelected = null;
 
     renderCalendar();
 }
 
-
-function isWithinCalendarHorizon(date) {
-
-    const start =
-        parseDate(
-            addMonths(
-                today(),
-                -CALENDAR_HORIZON_MONTHS
-            )
-        );
-
-    const end =
-        parseDate(
-            addMonths(
-                today(),
-                CALENDAR_HORIZON_MONTHS
-            )
-        );
-
-    const d =
-        parseDate(date);
-
-    return d >= start && d <= end;
-}
 
 function materialName(material) {
     if (typeof material === 'string') {
@@ -1203,112 +1613,13 @@ function materialName(material) {
     return '';
 }
 
-function recurrenceMatchesDate(task, date) {
-
-    if (task.recurrence === 'none') {
-        return task.due === date;
-    }
-
-    if (!isWithinCalendarHorizon(date)) {
-        return false;
-    }
-
-    const overrides = task.occurrenceOverrides || [];
-
-    // An individually moved occurrence appears on its new date.
-    if (overrides.some(x => x.newDate === date)) {
-        return true;
-    }
-
-    // A moved occurrence replaces the scheduled occurrences
-    // between its original date and its new date.
-    const isReplacedOccurrence = overrides.some(override => {
-        const start =
-            override.originalDate < override.newDate
-                ? override.originalDate
-                : override.newDate;
-
-        const end =
-            override.originalDate > override.newDate
-                ? override.originalDate
-                : override.newDate;
-
-        return (
-            date >= start &&
-            date <= end &&
-            date !== override.newDate
-        );
-    });
-
-    if (isReplacedOccurrence) {
-        return false;
-    }
-
-    const target = parseDate(date);
-    const start = parseDate(task.due);
-
-    if (target < start) {
-        return false;
-    }
-
-    switch (task.recurrence) {
-
-        case 'daily':
-            return true;
-
-        case 'weekly': {
-            const diff = Math.round(
-                (target - start) / 86400000
-            );
-
-            return diff % 7 === 0;
-        }
-
-        case 'biweekly': {
-            const diff = Math.round(
-                (target - start) / 86400000
-            );
-
-            return diff % 14 === 0;
-        }
-
-        case 'monthly':
-        case '3months':
-        case '6months':
-        case 'yearly': {
-
-            let cursor = task.due;
-
-            while (cursor < date) {
-                const next = nextOccurrence(
-                    cursor,
-                    task.recurrence
-                );
-
-                if (!next || next > date) {
-                    return false;
-                }
-
-                cursor = next;
-            }
-
-            return cursor === date;
-        }
-
-        default:
-            return false;
-    }
-}
-
 function calendarEventHTML(item, type, date) {
 
     const isTask =
         type === 'task';
 
     const completed =
-        isTask
-            ? false
-            : !!item.done;
+        !!item.done;
 
     const categoryClass =
         isTask
@@ -1318,7 +1629,7 @@ function calendarEventHTML(item, type, date) {
     return `
 
     <div
-        class="calendar-event ${categoryClass}"
+        class="calendar-event ${categoryClass} ${completed ? 'calendar-done' : ''}"
         draggable="true"
         data-id="${item.id}"
         data-type="${type}"
@@ -1361,22 +1672,21 @@ function calendarComplete(event, type, id, calendarDate) {
 
     if (type === 'task') {
 
-        const task =
-            db.tasks.find(
+        const occ =
+            db.occurrences.find(
                 x => x.id === id
             );
 
-        if (!task) {
+        if (!occ) {
             return;
         }
 
         /*
-         * For a calendar completion,
-         * the completion date is the
-         * calendar occurrence that was checked.
+         * The completion date is the calendar day the
+         * occurrence is sitting on.
          */
-        toggle(
-            id,
+        completeOccurrence(
+            occ,
             calendarDate
         );
 
@@ -1441,6 +1751,152 @@ document.addEventListener(
             );
     }
 );
+
+/* =========================
+   CALENDAR — PHONE LAYOUT HELPERS
+   (dots in the month grid + an agenda for the selected day;
+    shown only on narrow screens via CSS)
+========================= */
+
+function calendarSelectedDate() {
+
+    const prefix =
+        iso(new Date(calendarYear, calendarMonth, 1)).slice(0, 7);
+
+    if (calendarSelected && calendarSelected.startsWith(prefix)) {
+        return calendarSelected;
+    }
+
+    const t = today();
+
+    return t.startsWith(prefix) ? t : prefix + '-01';
+}
+
+function selectCalendarDay(date) {
+    calendarSelected = date;
+    renderCalendar();
+}
+
+function calendarDotsHTML(maintenanceEvents, todoEvents) {
+
+    const dots = [
+        ...maintenanceEvents.map(x => ({ kind: 'm', done: x.done })),
+        ...todoEvents.map(x => ({ kind: 't', done: x.done }))
+    ];
+
+    if (!dots.length) return '';
+
+    const shown = dots.slice(0, 4)
+        .map(d =>
+            `<i class="cal-dot ${d.kind} ${d.done ? 'done' : ''}"></i>`
+        )
+        .join('');
+
+    const more = dots.length > 4
+        ? `<span class="cal-more">+${dots.length - 4}</span>`
+        : '';
+
+    return `<div class="calendar-dots">${shown}${more}</div>`;
+}
+
+function calendarAgendaHTML(date) {
+
+    const label = new Date(date + 'T00:00:00')
+        .toLocaleDateString(undefined, {
+            weekday: 'long',
+            month: 'long',
+            day: 'numeric'
+        });
+
+    const rows = [
+        ...occurrenceViews(o => o.date === date)
+            .map(x => ({ item: x, type: 'task' })),
+        ...db.todos
+            .filter(x => x.planned === date)
+            .map(x => ({ item: x, type: 'todo' }))
+    ];
+
+    const body = rows.length
+        ? rows.map(({ item, type }) => `
+
+            <div class="agenda-item ${item.done ? 'agenda-done' : ''}">
+
+              <input
+                type="checkbox"
+                class="agenda-check"
+                ${item.done ? 'checked' : ''}
+                onchange="calendarComplete(event, '${type}', ${item.id}, '${date}')"
+              >
+
+              <div
+                class="agenda-main"
+                data-id="${item.id}"
+                data-type="${type}"
+                onclick="calendarEventClick(event)"
+              >
+                <div class="agenda-name">${esc(item.name)}</div>
+                <div class="agenda-meta">
+                  ${type === 'task' ? 'Maintenance' : 'To-Do'}
+                  ${item.category ? ' · ' + esc(item.category) : ''}
+                </div>
+              </div>
+
+              <input
+                type="date"
+                class="agenda-date"
+                value="${date}"
+                aria-label="Move to another date"
+                onchange="calendarMove('${type}', ${item.id}, this.value)"
+              >
+
+            </div>
+          `).join('')
+        : '<p class="muted agenda-empty">Nothing scheduled.</p>';
+
+    return `
+      <div class="calendar-agenda">
+        <h3>${esc(label)}</h3>
+        ${body}
+        <p class="muted agenda-hint">
+          Tap a day to see its items. Change the date on an item
+          to reschedule it, or tap its name to edit.
+        </p>
+      </div>
+    `;
+}
+
+/* Reschedule one item (the touch-friendly alternative to dragging). */
+function calendarMove(type, id, newDate) {
+
+    if (!newDate) return;
+
+    if (type === 'todo') {
+
+        const todo = db.todos.find(x => x.id === id);
+
+        if (!todo) return;
+
+        todo.planned = newDate;
+
+    } else {
+
+        const occ = db.occurrences.find(x => x.id === id);
+
+        if (!occ) return;
+
+        occ.date = newDate;
+    }
+
+    // Follow the item to its new month.
+    const [y, m] = newDate.split('-').map(Number);
+
+    calendarYear = y;
+    calendarMonth = m - 1;
+    calendarSelected = newDate;
+
+    save();
+    render();
+}
 
 function renderCalendar() {
 
@@ -1537,19 +1993,16 @@ function renderCalendar() {
         h += '<div class="day"></div>';
     }
 
+    const selectedDay = calendarSelectedDate();
+    const todayDate = today();
+
     for (let d = 1; d <= days; d++) {
 
         const q =
             iso(new Date(y, m, d));
 
         const maintenanceEvents =
-            db.tasks.filter(
-                task =>
-                    recurrenceMatchesDate(
-                        task,
-                        q
-                    )
-            );
+            occurrenceViews(o => o.date === q);
 
         const todoEvents =
             db.todos.filter(
@@ -1560,13 +2013,16 @@ function renderCalendar() {
         h += `
 
         <div
-            class="day"
+            class="day ${q === selectedDay ? 'selected' : ''} ${q === todayDate ? 'today' : ''}"
             data-date="${q}"
+            onclick="selectCalendarDay('${q}')"
             ondragover="calendarDragOver(event)"
             ondrop="calendarDrop(event, '${q}')"
         >
 
           <b>${d}</b>
+
+          ${calendarDotsHTML(maintenanceEvents, todoEvents)}
 
           <div class="calendar-events">
 
@@ -1601,13 +2057,15 @@ function renderCalendar() {
       </div>
 
       <p
-        class="muted"
+        class="muted calendar-help"
         style="font-size:.78rem;margin-bottom:0"
       >
         Drag an item to reschedule it. Check the box
         when it is actually completed. Click the name
         to edit it.
       </p>
+
+      ${calendarAgendaHTML(selectedDay)}
 
     </div>
     `;
@@ -1663,9 +2121,15 @@ function calendarEventClick(event) {
 
     if (type === 'task') {
 
-        const task =
-            db.tasks.find(
+        const occ =
+            db.occurrences.find(
                 x => x.id === id
+            );
+
+        const task =
+            occ &&
+            db.tasks.find(
+                x => x.id === occ.taskId
             );
 
         if (task) {
@@ -1677,7 +2141,6 @@ function calendarEventClick(event) {
 }
 
 function calendarDragStart(event) {
-
     const element = event.currentTarget;
 
     draggedCalendarItem = {
@@ -1709,160 +2172,35 @@ function calendarDragOver(event) {
 
 
 function calendarDrop(event) {
-
     event.preventDefault();
 
-    const day =
-        event.currentTarget;
+    const day = event.currentTarget;
+    day.classList.remove('calendar-drop-target');
 
-    day.classList.remove(
-        'calendar-drop-target'
-    );
-
-    const date =
-        day.dataset.date;
-
-    if (!date) {
-        return;
-    }
-
-    if (!draggedCalendarItem) {
-        return;
-    }
-
-    const item =
-        draggedCalendarItem;
+    const date = day.dataset.date;
+    const item = draggedCalendarItem;
 
     draggedCalendarItem = null;
 
-
-    /* =========================
-       TO-DO
-    ========================= */
+    if (!date || !item || item.date === date) return;
 
     if (item.type === 'todo') {
+        const todo = db.todos.find(x => x.id === item.id);
 
-        const todo =
-            db.todos.find(
-                x => x.id === item.id
-            );
-
-        if (!todo) {
-            return;
-        }
+        if (!todo) return;
 
         todo.planned = date;
-
         save();
         render();
-
         return;
     }
 
+    // Moving a maintenance item moves just that one occurrence.
+    const occ = db.occurrences.find(x => x.id === item.id);
 
-    /* =========================
-       MAINTENANCE
-    ========================= */
+    if (!occ) return;
 
-    const task =
-        db.tasks.find(
-            x => x.id === item.id
-        );
-
-    if (!task) {
-        return;
-    }
-
-
-    /*
-     * Non-recurring maintenance can
-     * simply be moved.
-     */
-
-    if (task.recurrence === 'none') {
-
-        task.due = date;
-
-        save();
-        render();
-
-        return;
-    }
-
-
-    /*
-     * If dropped on its existing date,
-     * nothing needs to happen.
-     */
-
-    // Find the actual scheduled occurrence represented
-    // by the calendar item. This also supports moving
-    // an occurrence that was already moved before.
-    const sourceDate = item.date;
-
-    const existingOverride =
-        (task.occurrenceOverrides || []).find(
-            x => x.newDate === sourceDate
-        );
-
-    const originalDate =
-        existingOverride
-            ? existingOverride.originalDate
-            : sourceDate;
-
-    if (sourceDate === date) {
-        return;
-    }
-
-    // YES: Move the schedule itself.
-    // The new date becomes the recurring anchor.
-    if (task.adjustSchedule) {
-
-        const recurrence = recurrenceLabel(task.recurrence);
-
-        setTimeout(() => {
-
-            const confirmed = confirm(
-                `"${task.name}" is a recurring maintenance item.\n\n` +
-                `Moving it to ${date} will change the schedule anchor.\n` +
-                `Future occurrences will continue from the new date ` +
-                `using ${recurrence.toLowerCase()}.\n\n` +
-                `Do you want to move the entire schedule?`
-            );
-
-            if (!confirmed) {
-                renderCalendar();
-                return;
-            }
-
-            task.due = date;
-            task.occurrenceOverrides = [];
-
-            save();
-            render();
-
-        }, 0);
-
-        return;
-    }
-
-    // NO: Move only this occurrence.
-    // The recurring schedule remains anchored.
-    if (!Array.isArray(task.occurrenceOverrides)) {
-        task.occurrenceOverrides = [];
-    }
-
-    // Remove the old override if this occurrence
-    // had already been moved.
-    task.occurrenceOverrides =
-        task.occurrenceOverrides.filter(
-            x => x.originalDate !== originalDate
-        );
-
-    task.occurrenceOverrides.push({
-        originalDate,
-        newDate: date
-    });
+    occ.date = date;
 
     save();
     render();
@@ -1875,110 +2213,13 @@ function calendarDrop(event) {
 
 function toggle(id, completedDate = today()) {
 
-    const task =
-        db.tasks.find(
+    const occ =
+        db.occurrences.find(
             x => x.id === id
         );
 
-    if (task) {
-
-        /*
-         * =========================
-         * RECURRING MAINTENANCE
-         * =========================
-         */
-
-        if (task.recurrence !== 'none') {
-
-            const completed =
-                completedDate || today();
-
-            task.completedAt =
-                completed;
-
-
-            /*
-             * YES:
-             * Future schedule is based
-             * on the actual completion date.
-             *
-             * Example:
-             * Due June 1
-             * Completed June 2
-             * Every 2 weeks
-             * Next due June 16
-             */
-
-            if (task.adjustSchedule) {
-
-                task.due =
-                    nextOccurrence(
-                        completed,
-                        task.recurrence
-                    );
-
-            }
-
-
-            /*
-             * NO:
-             * Keep the original schedule
-             * anchored to its existing dates.
-             *
-             * If the task was completed late,
-             * skip any occurrences that
-             * have already passed.
-             */
-
-            else {
-
-                let next =
-                    nextOccurrence(
-                        task.due,
-                        task.recurrence
-                    );
-
-                while (
-                    next &&
-                    next <= completed
-                ) {
-
-                    next =
-                        nextOccurrence(
-                            next,
-                            task.recurrence
-                        );
-                }
-
-                task.due =
-                    next || completed;
-            }
-
-
-            save();
-            render();
-
-            return;
-        }
-
-
-        /*
-         * =========================
-         * NON-RECURRING MAINTENANCE
-         * =========================
-         */
-
-        task.done =
-            !task.done;
-
-        task.completedAt =
-            task.done
-                ? today()
-                : null;
-
-        save();
-        render();
-
+    if (occ) {
+        completeOccurrence(occ, completedDate);
         return;
     }
 
@@ -2573,7 +2814,7 @@ function showForm(type, obj = null) {
             type="date"
             name="due"
             value="${esc(
-                    obj?.due || today()
+                    (obj && taskNextDue(obj)) || today()
                 )}"
           >
 
@@ -2843,16 +3084,32 @@ document
                         data.get('recurrence')
                     );
 
-                const task = {
+                const name =
+                    String(
+                        data.get('name') || ''
+                    ).trim();
 
-                    id:
-                        id ||
-                        Date.now(),
+                if (!name) {
 
-                    name:
-                        String(
-                            data.get('name') || ''
-                        ).trim(),
+                    alert(
+                        'Please enter a maintenance name.'
+                    );
+
+                    return;
+                }
+
+                const due =
+                    data.get('due') ||
+                    today();
+
+                const adjustSchedule =
+                    data.get(
+                        'scheduleBasis'
+                    ) === 'completion';
+
+                const fields = {
+
+                    name,
 
                     category:
                         addCategory(
@@ -2860,10 +3117,6 @@ document
                         ),
 
                     recurrence,
-
-                    due:
-                        data.get('due') ||
-                        today(),
 
                     minutes:
                         Number(
@@ -2873,41 +3126,40 @@ document
                     materials:
                         getMaterialsFromForm(),
 
-                    adjustSchedule:
-                        data.get(
-                            'scheduleBasis'
-                        ) === 'completion',
-
-                    completedAt:
-                        existing?.completedAt ||
-                        null,
-
-                    done:
-                        existing?.done ||
-                        false
+                    adjustSchedule
                 };
-
-
-                if (!task.name) {
-
-                    alert(
-                        'Please enter a maintenance name.'
-                    );
-
-                    return;
-                }
-
 
                 if (existing) {
 
-                    Object.assign(
-                        existing,
-                        task
-                    );
+                    const previousDue =
+                        taskNextDue(existing);
+
+                    const scheduleChanged =
+                        due !== previousDue ||
+                        recurrence !== existing.recurrence ||
+                        adjustSchedule !== existing.adjustSchedule;
+
+                    Object.assign(existing, fields);
+
+                    // Name, category, materials etc. apply to every
+                    // occurrence automatically. A changed date or
+                    // recurrence rebuilds the open occurrences.
+                    if (scheduleChanged) {
+                        rescheduleTask(existing, due);
+                    }
 
                 } else {
 
+                    const task = {
+                        id: uid(),
+                        ...fields,
+                        anchor: due,
+                        nextIndex: 0
+                    };
+
                     db.tasks.push(task);
+
+                    topUpOccurrences(task);
                 }
 
                 syncShop();
@@ -3063,6 +3315,11 @@ function delTask(id) {
                 x => x.id !== id
             );
 
+        db.occurrences =
+            db.occurrences.filter(
+                x => x.taskId !== id
+            );
+
         syncShop();
         save();
         render();
@@ -3087,6 +3344,203 @@ function delTodo(id) {
         render();
     }
 }
+
+/* =========================
+   BACKUP / RESTORE
+========================= */
+
+const LAST_EXPORT_KEY = K + '.lastExport';
+
+function buildBackup() {
+    return {
+        app: 'property-maintenance',
+        format: 1,
+        exportedAt: new Date().toISOString(),
+        data: db
+    };
+}
+
+function exportData() {
+
+    const backup = buildBackup();
+
+    const blob = new Blob(
+        [JSON.stringify(backup, null, 2)],
+        { type: 'application/json' }
+    );
+
+    const link = document.createElement('a');
+
+    link.href = URL.createObjectURL(blob);
+    link.download = `property-maintenance-${today()}.json`;
+
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+
+    setTimeout(() => URL.revokeObjectURL(link.href), 10000);
+
+    localStorage.setItem(LAST_EXPORT_KEY, backup.exportedAt);
+
+    renderBackup();
+}
+
+/* Validates backup text. Returns { error } or { data, exportedAt, counts }. */
+function parseBackup(text) {
+
+    let parsed;
+
+    try {
+        parsed = JSON.parse(text);
+    } catch (e) {
+        return { error: 'That file is not valid JSON.' };
+    }
+
+    // Accept both the wrapped backup format and a raw database.
+    const data = parsed && parsed.data ? parsed.data : parsed;
+
+    if (
+        !data ||
+        typeof data !== 'object' ||
+        !Array.isArray(data.tasks)
+    ) {
+        return {
+            error: 'That file does not look like a Property Maintenance backup.'
+        };
+    }
+
+    const badTask = data.tasks.find(
+        t => !t || typeof t !== 'object' || !t.id || !t.name
+    );
+
+    if (badTask) {
+        return { error: 'The backup contains a damaged maintenance item.' };
+    }
+
+    return {
+        data,
+        exportedAt: parsed.exportedAt || null,
+        counts: {
+            tasks: data.tasks.length,
+            todos: Array.isArray(data.todos) ? data.todos.length : 0
+        }
+    };
+}
+
+function applyBackup(data) {
+
+    // Safety copy of whatever is on this device right now.
+    localStorage.setItem(
+        K + '.backup-before-import',
+        JSON.stringify(db)
+    );
+
+    db = data;
+
+    prepareDB();
+    render();
+}
+
+function importData(event) {
+
+    const input = event.target;
+    const file = input.files && input.files[0];
+
+    if (!file) return;
+
+    const reader = new FileReader();
+
+    reader.onload = () => {
+
+        const result = parseBackup(String(reader.result || ''));
+
+        input.value = '';
+
+        if (result.error) {
+            alert(result.error);
+            return;
+        }
+
+        const when = result.exportedAt
+            ? new Date(result.exportedAt).toLocaleString()
+            : 'an unknown date';
+
+        const ok = confirm(
+            `Replace everything on this device with the backup from ${when}?\n\n` +
+            `${result.counts.tasks} maintenance items, ` +
+            `${result.counts.todos} to-dos.\n\n` +
+            `Your current data will be kept as a safety copy.`
+        );
+
+        if (ok) {
+            applyBackup(result.data);
+        }
+    };
+
+    reader.onerror = () => alert('Could not read that file.');
+
+    reader.readAsText(file);
+}
+
+function renderBackup() {
+
+    const last = localStorage.getItem(LAST_EXPORT_KEY);
+
+    document.querySelector('#backup').innerHTML = `
+
+    <div class="card">
+
+      <h2>Backup &amp; transfer</h2>
+
+      <p class="muted">
+        Your data is stored only in this browser on this device.
+        Download a backup to keep it safe or to move it to another
+        device (AirDrop, email or iCloud Drive work well).
+      </p>
+
+      <p class="meta">
+        Last backup:
+        ${last ? esc(new Date(last).toLocaleString()) : 'never'}
+      </p>
+
+      <div style="display:flex;gap:10px;flex-wrap:wrap;margin:12px 0">
+
+        <button
+          class="primary"
+          type="button"
+          onclick="exportData()"
+        >
+          Download backup
+        </button>
+
+        <button
+          class="small"
+          type="button"
+          onclick="document.querySelector('#importFile').click()"
+        >
+          Restore from backup…
+        </button>
+
+        <input
+          id="importFile"
+          type="file"
+          accept=".json,application/json"
+          hidden
+          onchange="importData(event)"
+        >
+
+      </div>
+
+      <p class="muted" style="font-size:.85rem">
+        On this device: ${db.tasks.length} maintenance items,
+        ${db.todos.length} to-dos.
+        Restoring replaces everything on this device with the backup.
+      </p>
+
+    </div>
+    `;
+}
+
 
 /* =========================
    TABS
@@ -3146,6 +3600,7 @@ function render() {
     renderMaintenance();
     renderTodo();
     renderShopping();
+    renderBackup();
 
 }
 

@@ -193,7 +193,7 @@ body {
 
 .calendar {
     display: grid;
-    grid-template-columns: repeat(7, 1fr);
+    grid-template-columns: repeat(7, minmax(0, 1fr));
     gap: 5px
 }
 
@@ -586,5 +586,168 @@ NEW CATEGORY
     .shopping-item .actions {
         width: 100%;
         margin-left: 28px;
+    }
+}
+/* Completed occurrences stay visible on the calendar */
+.calendar-done .calendar-event-name {
+    text-decoration: line-through;
+    opacity: .55;
+}
+
+/* =========================
+   CALENDAR — phone layout
+========================= */
+
+/* Desktop: dots and agenda are hidden; the chip grid is used. */
+.calendar-dots,
+.calendar-agenda {
+    display: none;
+}
+
+.day.today b {
+    text-decoration: underline;
+}
+
+.cal-dot {
+    display: inline-block;
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    background: #17202a;
+}
+
+.cal-dot.t {
+    background: #9e7563;
+}
+
+.cal-dot.done {
+    opacity: .3;
+}
+
+.cal-more {
+    font-size: .6rem;
+    line-height: 7px;
+    color: #6b7280;
+}
+
+@media (max-width: 700px) {
+
+    /* Tabs: a tidy 3x2 grid instead of a sideways scroll. */
+    .tabs {
+        display: grid;
+        grid-template-columns: repeat(3, 1fr);
+        gap: 4px;
+        overflow: visible;
+    }
+
+    .tab {
+        padding: 10px 4px;
+        text-align: center;
+        font-size: .9rem;
+    }
+
+    /* Month grid: compact cells with dots. */
+    .calendar {
+        gap: 3px;
+    }
+
+    .dow {
+        padding: 5px 0;
+        font-size: .68rem;
+    }
+
+    .day {
+        min-height: 50px;
+        padding: 5px 2px;
+        text-align: center;
+        cursor: pointer;
+    }
+
+    .day b {
+        font-size: .88rem;
+    }
+
+    .day.selected {
+        border-color: #17202a;
+        box-shadow: inset 0 0 0 1.5px #17202a;
+    }
+
+    .calendar-events,
+    .calendar-help {
+        display: none;
+    }
+
+    .calendar-dots {
+        display: flex;
+        justify-content: center;
+        align-items: center;
+        gap: 3px;
+        flex-wrap: wrap;
+        margin-top: 5px;
+    }
+
+    /* Agenda for the selected day. */
+    .calendar-agenda {
+        display: block;
+        margin-top: 16px;
+        border-top: 1px solid #e5e7eb;
+        padding-top: 12px;
+    }
+
+    .calendar-agenda h3 {
+        margin: 0 0 8px;
+        font-size: 1.05rem;
+    }
+
+    .agenda-item {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        padding: 10px 0;
+        border-bottom: 1px solid #eef0f3;
+    }
+
+    .agenda-check {
+        width: 24px;
+        height: 24px;
+        flex: none;
+        margin: 0;
+    }
+
+    .agenda-main {
+        flex: 1;
+        min-width: 0;
+        cursor: pointer;
+    }
+
+    .agenda-name {
+        font-weight: 650;
+        overflow-wrap: anywhere;
+    }
+
+    .agenda-meta {
+        font-size: .78rem;
+        color: #6b7280;
+    }
+
+    .agenda-done .agenda-name {
+        text-decoration: line-through;
+        opacity: .55;
+    }
+
+    .agenda-date {
+        flex: none;
+        width: 132px;
+        font-size: .85rem;
+        padding: 6px;
+    }
+
+    .agenda-empty {
+        margin: 10px 0;
+    }
+
+    .agenda-hint {
+        font-size: .78rem;
+        margin: 12px 0 0;
     }
 }
