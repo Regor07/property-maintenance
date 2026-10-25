@@ -24,7 +24,7 @@ Open `index.html` in a browser (no build step), or host the folder as static fil
 Open the Pages URL in **Safari** → Share → **Add to Home Screen**. Use the home screen icon from then on.
 
 ### Moving data between devices
-Data lives in each browser's own storage. Use the **Backup** tab: *Download backup* on one device, *Restore from backup* on the other.
+Data lives in each browser's own storage. Use the **Settings** tab: *Download backup* on one device, *Restore from backup* on the other.
 (Automatic sync is planned with Supabase.)
 
 ## Cloud sync (Supabase) — one-time setup
@@ -34,8 +34,8 @@ The app works without this. Add it to keep your phone and computer in sync.
 2. **Create your login.** *Authentication → Users → Add user → Create new user*. Enter your email and a password and tick *Auto Confirm User*.
 3. **Lock out strangers.** In *Authentication* (Sign In / Providers → User Signups), turn **off** "Allow new users to sign up" so only the account you just made can sign in.
 4. **Copy your keys.** *Project Settings → API Keys*: copy the **Project URL** and the **publishable (anon) key**. Never use the *secret* / *service_role* key.
-5. **Paste them into `config.js`**, commit and push.
-6. Open the app → **Backup** tab → **Cloud sync** → sign in. Do this first on the device that has your data; it uploads it. Then sign in on your other devices; they download it.
+5. **Create `config.js`** by copying `config.example.js` and pasting your values into it, then commit and push. (`config.js` is your own file; zips I send you never contain it, so it can't be overwritten.)
+6. Open the app → **Settings** tab → **Cloud sync** → sign in. Do this first on the device that has your data; it uploads it. Then sign in on your other devices; they download it.
 
 How it behaves:
 - Edits save on the device immediately and upload a moment later; a badge under the title shows the sync state.

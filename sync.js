@@ -77,11 +77,18 @@
         const badge = document.getElementById('syncBadge');
 
         if (badge) {
+            const time = lastSynced
+                ? lastSynced.toLocaleTimeString(undefined, {
+                    hour: 'numeric',
+                    minute: '2-digit'
+                })
+                : '';
+
             const text = {
-                synced: '☁ Synced',
+                synced: time ? `☁ Synced ${time}` : '☁ Synced',
                 saving: '☁ Saving…',
                 offline: '⚠ Offline – saved on this device',
-                error: '⚠ Sync problem – see Backup tab'
+                error: '⚠ Sync problem – see Settings tab'
             }[status] || '';
 
             badge.textContent = text;
@@ -314,7 +321,9 @@
 
         try {
 
-            setStatus('saving');
+            // Only show "Saving…" when there is something to upload;
+            // a routine check for changes shouldn't flash it.
+            if (isDirty()) setStatus('saving');
 
             for (let i = 0; i < 4; i++) {
                 if ((await reconcile()) === 'done') break;

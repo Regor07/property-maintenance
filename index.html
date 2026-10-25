@@ -6,6 +6,15 @@
     <meta name="viewport" content="width=device-width,initial-scale=1">
     <meta name="theme-color" content="#17202a">
     <title>Property Maintenance</title>
+    <script>
+        // Apply a saved Light/Dark choice before first paint (no flash).
+        try {
+            var t = localStorage.getItem('propertyMaintenance.v2.theme');
+            if (t === 'dark' || t === 'light') {
+                document.documentElement.setAttribute('data-theme', t);
+            }
+        } catch (e) { }
+    </script>
     <link rel="manifest" href="manifest.webmanifest">
     <link rel="apple-touch-icon" href="icon-180.png">
     <meta name="apple-mobile-web-app-capable" content="yes">
@@ -33,7 +42,7 @@
             <button class="tab" data-tab="maintenance">Maintenance</button>
             <button class="tab" data-tab="todo">To-Do</button>
             <button class="tab" data-tab="shopping">Shopping</button>
-            <button class="tab" data-tab="backup">Backup</button>
+            <button class="tab" data-tab="backup">Settings</button>
         </nav>
 
         <section id="weekend" class="view active"></section>

@@ -1783,7 +1783,15 @@ function calendarSelectedDate() {
 }
 
 function selectCalendarDay(date) {
+
+    // Tapping a day from the previous/next month jumps to that month.
+    const [yy, mm] = date.split('-').map(Number);
+
+    calendarYear = yy;
+    calendarMonth = mm - 1;
+
     calendarSelected = date;
+
     renderCalendar();
 }
 
@@ -1908,6 +1916,68 @@ function calendarMove(type, id, newDate) {
     render();
 }
 
+/* One cell of the month grid. `outside` = a day from the previous
+   or next month, shown faded to complete the week. */
+function calendarDayHTML(q, outside, selectedDay, todayDate) {
+
+    const maintenanceEvents =
+        occurrenceViews(o => o.date === q);
+
+    const todoEvents =
+        db.todos.filter(
+            task =>
+                task.planned === q
+        );
+
+    const classes = [
+        'day',
+        outside ? 'outside' : '',
+        q === selectedDay ? 'selected' : '',
+        q === todayDate ? 'today' : ''
+    ].filter(Boolean).join(' ');
+
+    return `
+
+        <div
+            class="${classes}"
+            data-date="${q}"
+            onclick="selectCalendarDay('${q}')"
+            ondragover="calendarDragOver(event)"
+            ondrop="calendarDrop(event, '${q}')"
+        >
+
+          <b>${Number(q.slice(8))}</b>
+
+          ${calendarDotsHTML(maintenanceEvents, todoEvents)}
+
+          <div class="calendar-events">
+
+            ${maintenanceEvents
+                .map(task =>
+                    calendarEventHTML(
+                        task,
+                        'task',
+                        q
+                    )
+                )
+                .join('')}
+
+            ${todoEvents
+                .map(todo =>
+                    calendarEventHTML(
+                        todo,
+                        'todo',
+                        q
+                    )
+                )
+                .join('')}
+
+          </div>
+
+        </div>
+        `;
+}
+
 function renderCalendar() {
 
     const y = calendarYear;
@@ -1999,67 +2069,38 @@ function renderCalendar() {
 
     `;
 
-    for (let i = 0; i < off; i++) {
-        h += '<div class="day"></div>';
-    }
-
     const selectedDay = calendarSelectedDate();
     const todayDate = today();
 
+    // Fill out the first and last week with the neighbouring
+    // months' days, like a wall calendar.
+    const trailing = (7 - ((off + days) % 7)) % 7;
+
+    for (let i = off; i >= 1; i--) {
+        h += calendarDayHTML(
+            iso(new Date(y, m, 1 - i)),
+            true,
+            selectedDay,
+            todayDate
+        );
+    }
+
     for (let d = 1; d <= days; d++) {
+        h += calendarDayHTML(
+            iso(new Date(y, m, d)),
+            false,
+            selectedDay,
+            todayDate
+        );
+    }
 
-        const q =
-            iso(new Date(y, m, d));
-
-        const maintenanceEvents =
-            occurrenceViews(o => o.date === q);
-
-        const todoEvents =
-            db.todos.filter(
-                task =>
-                    task.planned === q
-            );
-
-        h += `
-
-        <div
-            class="day ${q === selectedDay ? 'selected' : ''} ${q === todayDate ? 'today' : ''}"
-            data-date="${q}"
-            onclick="selectCalendarDay('${q}')"
-            ondragover="calendarDragOver(event)"
-            ondrop="calendarDrop(event, '${q}')"
-        >
-
-          <b>${d}</b>
-
-          ${calendarDotsHTML(maintenanceEvents, todoEvents)}
-
-          <div class="calendar-events">
-
-            ${maintenanceEvents
-                .map(task =>
-                    calendarEventHTML(
-                        task,
-                        'task',
-                        q
-                    )
-                )
-                .join('')}
-
-            ${todoEvents
-                .map(todo =>
-                    calendarEventHTML(
-                        todo,
-                        'todo',
-                        q
-                    )
-                )
-                .join('')}
-
-          </div>
-
-        </div>
-        `;
+    for (let d = 1; d <= trailing; d++) {
+        h += calendarDayHTML(
+            iso(new Date(y, m + 1, d)),
+            true,
+            selectedDay,
+            todayDate
+        );
     }
 
     h += `
@@ -3551,8 +3592,90 @@ function renderBackup() {
       </p>
 
     </div>
+
+    <div class="card">
+
+      <h2>Appearance</h2>
+
+      <div class="seg">
+        ${[
+            ['auto', 'Auto (match device)'],
+            ['light', 'Light'],
+            ['dark', 'Dark']
+        ].map(([mode, label]) => `
+          <button
+            type="button"
+            class="${getTheme() === mode ? 'seg-on' : ''}"
+            onclick="setTheme('${mode}')"
+          >${label}</button>
+        `).join('')}
+      </div>
+
+    </div>
     `;
 }
+
+
+/* =========================
+   THEME
+   'auto' follows the device; 'light' / 'dark' force it.
+   (index.html applies a saved choice before first paint.)
+========================= */
+
+const THEME_KEY = K + '.theme';
+
+function getTheme() {
+    const t = localStorage.getItem(THEME_KEY);
+    return t === 'light' || t === 'dark' ? t : 'auto';
+}
+
+function applyTheme() {
+
+    const root = document.documentElement;
+
+    if (!root || !root.setAttribute) return;
+
+    const mode = getTheme();
+
+    if (mode === 'auto') {
+        root.removeAttribute('data-theme');
+    } else {
+        root.setAttribute('data-theme', mode);
+    }
+
+    // Keep the browser / status-bar colour in step with the page.
+    if (typeof getComputedStyle === 'function') {
+
+        const surface = getComputedStyle(root)
+            .getPropertyValue('--surface')
+            .trim();
+
+        const meta = document.querySelector('meta[name="theme-color"]');
+
+        if (surface && meta && meta.setAttribute) {
+            meta.setAttribute('content', surface);
+        }
+    }
+}
+
+function setTheme(mode) {
+
+    if (mode === 'auto') {
+        localStorage.removeItem(THEME_KEY);
+    } else {
+        localStorage.setItem(THEME_KEY, mode);
+    }
+
+    applyTheme();
+    renderBackup();
+}
+
+if (typeof window.matchMedia === 'function') {
+    window.matchMedia('(prefers-color-scheme: dark)')
+        .addEventListener('change', applyTheme);
+}
+
+applyTheme();
 
 
 /* =========================
