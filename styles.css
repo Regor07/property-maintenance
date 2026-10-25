@@ -751,3 +751,43 @@ NEW CATEGORY
         margin: 12px 0 0;
     }
 }
+
+/* Cloud sync */
+.sync-badge {
+    margin: 4px 0 0;
+    font-size: .78rem;
+    color: #6b7280;
+}
+
+.sync-badge:empty {
+    display: none;
+}
+
+.sync-fields {
+    display: grid;
+    gap: 10px;
+    max-width: 360px;
+    margin-top: 10px;
+}
+
+.sync-msg {
+    color: #b42318;
+    font-size: .9rem;
+    margin: 10px 0 0;
+}
+
+.sync-status {
+    margin: 6px 0 0;
+    font-weight: 600;
+}
+
+.sync-offline,
+.sync-error {
+    color: #b42318;
+}
+
+/* 16px stops iPhone Safari from zooming the page when an input is focused */
+.sync-fields input {
+    font-size: 16px;
+    padding: 10px 12px;
+}

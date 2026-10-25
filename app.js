@@ -332,13 +332,23 @@ function prepareDB() {
     syncCategories();
     syncShop();
     topUpAllOccurrences();
-    save();
+    persistLocal();
 }
 
 prepareDB();
 
-function save() {
+/* Write to this device only (used for derived/upgrade changes). */
+function persistLocal() {
     localStorage.setItem(K, JSON.stringify(db));
+}
+
+/* A real change by the person: save here and queue a cloud sync. */
+function save() {
+    persistLocal();
+
+    if (window.cloudSync) {
+        window.cloudSync.markDirty();
+    }
 }
 
 
@@ -3438,6 +3448,7 @@ function applyBackup(data) {
     db = data;
 
     prepareDB();
+    save();          // a restore is a real change: sync it
     render();
 }
 
@@ -3488,14 +3499,16 @@ function renderBackup() {
 
     document.querySelector('#backup').innerHTML = `
 
+    ${window.cloudSync ? window.cloudSync.cardHTML() : ''}
+
     <div class="card">
 
       <h2>Backup &amp; transfer</h2>
 
       <p class="muted">
-        Your data is stored only in this browser on this device.
-        Download a backup to keep it safe or to move it to another
-        device (AirDrop, email or iCloud Drive work well).
+        A backup file is a safe copy of everything in the app.
+        Keep one for peace of mind, or use it to move your data
+        without cloud sync (AirDrop, email or iCloud Drive work well).
       </p>
 
       <p class="meta">
